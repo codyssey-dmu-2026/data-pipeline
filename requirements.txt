@@ -1,0 +1,14 @@
+yfinance==1.7.0
+pykrx==1.2.9
+pandas==2.3.3
+numpy==2.2.6
+pandas-ta==0.4.71b0
+OpenDartReader==0.2.2
+requests==2.34.2
+feedparser==6.0.14
+beautifulsoup4==4.13.5
+python-dotenv==1.0.1
+pyarrow==17.0.0
+pytest==8.3.5
+flake8==7.1.2
+black==24.10.0
