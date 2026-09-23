@@ -33,6 +33,19 @@ DART_TARGETS = {
 }
 DART_REPORT_KEYWORDS = ("사업보고서", "분기보고서", "반기보고서")
 
+# SEC EDGAR는 요청자를 식별할 수 있는 이메일이 포함된 User-Agent를 요구한다
+# (https://www.sec.gov/os/webmaster-faq#developers). .env의 SEC_EDGAR_CONTACT_EMAIL로 설정.
+SEC_CONTACT_EMAIL = os.getenv("SEC_EDGAR_CONTACT_EMAIL")
+SEC_TICKER_CIK_URL = "https://www.sec.gov/files/company_tickers.json"
+SEC_SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik:010d}.json"
+SEC_FILING_URL = (
+    "https://www.sec.gov/Archives/edgar/data/{cik}/{accession_nodash}/{doc}"
+)
+SEC_TARGETS = {"AAPL": "AAPL", "MSFT": "MSFT", "NVDA": "NVDA"}
+SEC_FORM_TYPES = ("10-K", "10-Q")
+
+_sec_cik_cache = None
+
 # 네이버 금융 뉴스 API는 더 이상 사용하지 않음: finance.naver.com/news.naver.com은
 # robots.txt에서 전체 경로를 Disallow하고 있어(CLAUDE.md의 robots.txt 준수 요건 위반) 사용 불가.
 # 대신 CLAUDE.md에 허용 소스로 명시된 한국경제(hankyung.com)의 공개 RSS 피드를 사용한다.
@@ -76,6 +89,60 @@ def collect_dart_disclosures(corp_code, corp_name):
                 "본문요약": _clean_text(r["report_nm"], SUMMARY_LIMIT),
                 "게시일": r["rcept_dt"],
                 "원문URL": f"https://dart.fss.or.kr/dsaf001/main.do?rcpNo={r['rcept_no']}",
+            }
+        )
+    return rows
+
+
+def _sec_headers():
+    if not SEC_CONTACT_EMAIL:
+        logger.warning(
+            "SEC_EDGAR_CONTACT_EMAIL not set in .env; SEC EDGAR requires a real "
+            "contact email in the User-Agent header, requests may be blocked."
+        )
+    email = SEC_CONTACT_EMAIL or "unknown@example.com"
+    return {"User-Agent": f"data-pipeline educational project ({email})"}
+
+
+def _get_cik(ticker):
+    global _sec_cik_cache
+    if _sec_cik_cache is None:
+        response = requests.get(SEC_TICKER_CIK_URL, headers=_sec_headers(), timeout=10)
+        response.raise_for_status()
+        _sec_cik_cache = {
+            row["ticker"]: row["cik_str"] for row in response.json().values()
+        }
+    cik = _sec_cik_cache.get(ticker)
+    if cik is None:
+        raise ValueError(f"CIK not found for ticker {ticker}")
+    return cik
+
+
+def collect_sec_filings(ticker):
+    cik = _get_cik(ticker)
+    url = SEC_SUBMISSIONS_URL.format(cik=cik)
+    response = requests.get(url, headers=_sec_headers(), timeout=10)
+    response.raise_for_status()
+    recent = response.json()["filings"]["recent"]
+
+    rows = []
+    for i, form in enumerate(recent["form"]):
+        filing_date = recent["filingDate"][i]
+        if form not in SEC_FORM_TYPES or filing_date < START_DATE:
+            continue
+
+        accession_nodash = recent["accessionNumber"][i].replace("-", "")
+        doc_url = SEC_FILING_URL.format(
+            cik=cik, accession_nodash=accession_nodash, doc=recent["primaryDocument"][i]
+        )
+        title = f"{form} ({recent['reportDate'][i]})"
+        rows.append(
+            {
+                "종목명": ticker,
+                "제목": title,
+                "본문요약": _clean_text(title, SUMMARY_LIMIT),
+                "게시일": filing_date,
+                "원문URL": doc_url,
             }
         )
     return rows
@@ -159,6 +226,15 @@ def collect_all():
             logger.exception(
                 "Failed to collect DART disclosures for %s (%s)", code, name
             )
+        time.sleep(REQUEST_DELAY_SEC)
+
+    for ticker, name in SEC_TARGETS.items():
+        try:
+            rows = collect_sec_filings(ticker)
+            collected.setdefault(ticker, []).extend(rows)
+            print(f"[SEC EDGAR {name}] {len(rows)} filings collected")
+        except Exception:
+            logger.exception("Failed to collect SEC EDGAR filings for %s", ticker)
         time.sleep(REQUEST_DELAY_SEC)
 
     try:
