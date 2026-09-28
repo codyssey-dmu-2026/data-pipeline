@@ -24,14 +24,18 @@ def merge_prices():
 
     merged = pd.concat(series_list, axis=1).sort_index()
     total_rows = len(merged)
+    before_na = int(merged.isna().sum().sum())
 
-    common = merged.dropna(how="any")
+    # 한국/미국 휴장일은 직전 종가로 채운다 (ffill만 사용, 미래 값으로 채우지 않음).
+    # ffill 후에도 남는 결측치(일부 종목의 상장/수집 시작 이전 구간)만 제거한다.
+    filled = merged.ffill()
+    filled_na = before_na - int(filled.isna().sum().sum())
+    common = filled.dropna(how="any")
     common_rows = len(common)
 
-    dropped_pct = (total_rows - common_rows) / total_rows * 100 if total_rows else 0.0
     print(
-        f"merge_prices: {total_rows} rows -> {common_rows} common rows "
-        f"({dropped_pct:.2f}% dropped)"
+        f"merge_prices: {total_rows} rows, {filled_na} NaNs forward-filled -> "
+        f"{common_rows} rows ({total_rows - common_rows} leading rows dropped)"
     )
 
     return common
@@ -47,7 +51,8 @@ def compute_features(prices, rsi_length=14):
         rsi.iloc[: rsi_length - 1] = np.nan
         features[f"{ticker}_rsi"] = rsi
 
-        features[f"{ticker}_macd"] = compute_macd(price)
+        # MACD는 가격 수준에 비례하므로 가격으로 나눠 스케일을 제거한다
+        features[f"{ticker}_macd"] = compute_macd(price) / price
     return features
 
 
@@ -162,8 +167,9 @@ def run_pipeline(train_end_date=TRAIN_END_DATE):
     normalized.to_parquet(FEATURES_PATH)
     print(f"run_pipeline: saved features -> {FEATURES_PATH} (shape={normalized.shape})")
 
-    return_cols = [c for c in normalized.columns if c.endswith("_return")]
-    returns = normalized[return_cols]
+    # returns.parquet은 RL 보상 계산용이므로 정규화 전 원래 로그 수익률을 저장한다
+    return_cols = [c for c in clean.columns if c.endswith("_return")]
+    returns = clean[return_cols]
     returns.to_parquet(RETURNS_PATH)
     print(f"run_pipeline: saved returns -> {RETURNS_PATH} (shape={returns.shape})")
 

@@ -2,11 +2,19 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from config import FEATURES_PATH, KR_TICKERS, RAW_NEWS_DIR, RAW_PRICE_DIR, US_TICKERS
+from config import (
+    FEATURES_PATH,
+    KR_TICKERS,
+    RAW_NEWS_DIR,
+    RAW_PRICE_DIR,
+    RETURNS_PATH,
+    US_TICKERS,
+)
 from preprocess import compute_features, handle_missing, merge_prices, normalize
 
 ALL_TICKERS = US_TICKERS + list(KR_TICKERS.keys())
 ZSCORE_ABS_LIMIT = 6.0
+RAW_RETURN_STD_LIMIT = 0.2
 REQUIRED_NEWS_COLUMNS = ["종목명", "제목", "본문요약", "게시일", "원문URL"]
 
 
@@ -70,3 +78,33 @@ def test_normalize_with_custom_train_end_date(clean_features):
     assert np.isfinite(normalized.to_numpy()).all()
     assert not scaler.mean_.isna().any()
     assert not scaler.std_.isna().any()
+
+
+@pytest.fixture(scope="module")
+def returns():
+    if not RETURNS_PATH.exists():
+        pytest.skip(f"{RETURNS_PATH} not found; run `python main.py` first")
+    return pd.read_parquet(RETURNS_PATH)
+
+
+def test_returns_are_raw_log_returns(returns, features):
+    # 정규화된 값이면 std가 ~1이 되므로, 일간 로그 수익률 범위인지 확인한다
+    assert returns.index.equals(features.index)
+    assert (returns.std() < RAW_RETURN_STD_LIMIT).all()
+    assert returns.isna().sum().sum() == 0
+
+
+def test_merge_prices_forward_fills_holidays():
+    if not any(RAW_PRICE_DIR.glob("*.csv")):
+        pytest.skip(f"no price CSVs found in {RAW_PRICE_DIR}")
+    prices = merge_prices()
+    raw = pd.concat(
+        [
+            pd.read_csv(p, index_col="date", parse_dates=True)["adj_close"]
+            for p in RAW_PRICE_DIR.glob("*.csv")
+        ],
+        axis=1,
+    )
+    first_complete = raw.dropna(how="any").index.min()
+    # 공통 시작일 이후의 모든 거래일(한쪽 시장 휴장일 포함)이 보존되어야 한다
+    assert len(prices) == (raw.index >= first_complete).sum()
