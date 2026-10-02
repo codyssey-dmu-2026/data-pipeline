@@ -3,7 +3,8 @@ import logging
 import os
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 import feedparser
 import OpenDartReader
@@ -60,11 +61,27 @@ NEWS_TARGETS = {
 
 COLUMNS = ["종목명", "제목", "본문요약", "게시일", "원문URL"]
 
+KST = ZoneInfo("Asia/Seoul")
+
 
 def _clean_text(text, limit=None):
     text = re.sub(r"<.*?>", "", text or "")
     text = html.unescape(text).strip()
     return text[:limit] if limit else text
+
+
+def _to_kst_iso(dt):
+    """소스마다 다른 날짜/시각 표현을 KST 기준 ISO 8601 문자열로 통일한다.
+
+    tz 정보가 없는 datetime(DART rcept_dt처럼 날짜만 있는 값)은 이미 KST
+    벽시계 값이라고 간주해 그대로 KST로 태깅한다. tz-aware datetime(SEC
+    acceptanceDateTime의 UTC, RSS published_parsed의 UTC 정규화 값 등)은
+    KST로 변환한다. 초 단위까지만 남겨(micro/milli초 버림) 소스 간 형식을
+    통일한다. 예: 2026-09-29T09:35:51+09:00
+    """
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=KST)
+    return dt.astimezone(KST).replace(microsecond=0).isoformat()
 
 
 def collect_dart_disclosures(corp_code, corp_name):
@@ -78,12 +95,15 @@ def collect_dart_disclosures(corp_code, corp_name):
 
     rows = []
     for _, r in disclosures.iterrows():
+        # DART list API는 접수일자(rcept_dt, YYYYMMDD)만 주고 접수 시각은 주지
+        # 않으므로, 해당 날짜의 00:00:00 KST로 채운다(시각 정밀도 없음).
+        published_at = _to_kst_iso(datetime.strptime(r["rcept_dt"], "%Y%m%d"))
         rows.append(
             {
                 "종목명": corp_name,
                 "제목": r["report_nm"],
                 "본문요약": _clean_text(r["report_nm"], SUMMARY_LIMIT),
-                "게시일": r["rcept_dt"],
+                "게시일": published_at,
                 "원문URL": f"https://dart.fss.or.kr/dsaf001/main.do?rcpNo={r['rcept_no']}",
             }
         )
@@ -118,12 +138,21 @@ def collect_sec_filings(ticker):
     response = requests.get(url, headers=_sec_headers(), timeout=10)
     response.raise_for_status()
     recent = response.json()["filings"]["recent"]
+    acceptance_times = recent.get("acceptanceDateTime") or []
 
     rows = []
     for i, form in enumerate(recent["form"]):
         filing_date = recent["filingDate"][i]
         if form not in SEC_FORM_TYPES or filing_date < START_DATE:
             continue
+
+        # acceptanceDateTime(UTC, 분/초 단위)이 있으면 그걸 쓰고, 없는 건은
+        # filingDate(날짜만)를 00:00:00 KST로 채운다.
+        acceptance = acceptance_times[i] if i < len(acceptance_times) else None
+        if acceptance:
+            published_at = _to_kst_iso(datetime.fromisoformat(acceptance))
+        else:
+            published_at = _to_kst_iso(datetime.strptime(filing_date, "%Y-%m-%d"))
 
         accession_nodash = recent["accessionNumber"][i].replace("-", "")
         doc_url = SEC_FILING_URL.format(
@@ -135,7 +164,7 @@ def collect_sec_filings(ticker):
                 "종목명": ticker,
                 "제목": title,
                 "본문요약": _clean_text(title, SUMMARY_LIMIT),
-                "게시일": filing_date,
+                "게시일": published_at,
                 "원문URL": doc_url,
             }
         )
@@ -187,13 +216,14 @@ def collect_hankyung_news():
             summary = fetch_article_summary(entry.link)
             time.sleep(REQUEST_DELAY_SEC)
 
-            pub_date = datetime(*entry.published_parsed[:6])
+            # feedparser의 published_parsed는 UTC로 정규화된 struct_time이다.
+            pub_date_utc = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc)
             rows_by_ticker[ticker].append(
                 {
                     "종목명": target["corp_name"],
                     "제목": _clean_text(entry.title),
                     "본문요약": summary,
-                    "게시일": pub_date.strftime("%Y-%m-%d"),
+                    "게시일": _to_kst_iso(pub_date_utc),
                     "원문URL": entry.link,
                 }
             )
