@@ -30,6 +30,15 @@ DART_TARGETS = {
     "005930": "삼성전자",
     "000660": "SK하이닉스",
 }
+# DART 공시유형 코드(OpenDartReader.list의 kind): A=정기공시, B=주요사항보고,
+# I=거래소공시(수시공시). DART API는 kind를 한 번에 하나만 받으므로 종목당
+# 여러 번 호출해서 합친다.
+DART_PERIODIC_KIND = "A"
+DART_MATERIAL_EVENT_KIND = "B"
+DART_TIMELY_DISCLOSURE_KIND = "I"
+DART_KINDS = (DART_PERIODIC_KIND, DART_MATERIAL_EVENT_KIND, DART_TIMELY_DISCLOSURE_KIND)
+# 정기공시(A)는 사업/분기/반기보고서만 남긴다(그 외 잡다한 정기 서류 제외).
+# B/I는 그 자체가 이미 원하는 카테고리라 별도 키워드 필터가 필요 없다.
 DART_REPORT_KEYWORDS = ("사업보고서", "분기보고서", "반기보고서")
 
 # SEC EDGAR는 요청자를 식별할 수 있는 이메일이 포함된 User-Agent를 요구한다
@@ -42,7 +51,7 @@ SEC_SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik:010d}.json"
 SEC_SUBMISSIONS_FILE_URL = "https://data.sec.gov/submissions/{name}"
 SEC_FILING_URL = "https://www.sec.gov/Archives/edgar/data/{cik}/{accession_nodash}/{doc}"
 SEC_TARGETS = {"AAPL": "AAPL", "MSFT": "MSFT", "NVDA": "NVDA"}
-SEC_FORM_TYPES = ("10-K", "10-Q")
+SEC_FORM_TYPES = ("10-K", "10-Q", "8-K")
 
 _sec_cik_cache = None
 
@@ -90,27 +99,33 @@ def _to_kst_iso(dt):
 
 def collect_dart_disclosures(corp_code, corp_name):
     dart = OpenDartReader(DART_API_KEY)
-    disclosures = dart.list(corp_code, start=START_DATE, end=END_DATE, kind="A")
-    if disclosures is None or disclosures.empty:
-        return []
-
-    mask = disclosures["report_nm"].str.contains("|".join(DART_REPORT_KEYWORDS))
-    disclosures = disclosures[mask].sort_values("rcept_dt", ascending=False)
 
     rows = []
-    for _, r in disclosures.iterrows():
-        # DART list API는 접수일자(rcept_dt, YYYYMMDD)만 주고 접수 시각은 주지
-        # 않으므로, 해당 날짜의 00:00:00 KST로 채운다(시각 정밀도 없음).
-        published_at = _to_kst_iso(datetime.strptime(r["rcept_dt"], "%Y%m%d"))
-        rows.append(
-            {
-                "종목명": corp_name,
-                "제목": r["report_nm"],
-                "본문요약": _clean_text(r["report_nm"], SUMMARY_LIMIT),
-                "게시일": published_at,
-                "원문URL": f"https://dart.fss.or.kr/dsaf001/main.do?rcpNo={r['rcept_no']}",
-            }
-        )
+    for kind in DART_KINDS:
+        disclosures = dart.list(corp_code, start=START_DATE, end=END_DATE, kind=kind)
+        time.sleep(REQUEST_DELAY_SEC)
+        if disclosures is None or disclosures.empty:
+            continue
+
+        if kind == DART_PERIODIC_KIND:
+            mask = disclosures["report_nm"].str.contains("|".join(DART_REPORT_KEYWORDS))
+            disclosures = disclosures[mask]
+
+        for _, r in disclosures.iterrows():
+            # DART list API는 접수일자(rcept_dt, YYYYMMDD)만 주고 접수 시각은 주지
+            # 않으므로, 해당 날짜의 00:00:00 KST로 채운다(시각 정밀도 없음).
+            published_at = _to_kst_iso(datetime.strptime(r["rcept_dt"], "%Y%m%d"))
+            rows.append(
+                {
+                    "종목명": corp_name,
+                    "제목": r["report_nm"],
+                    "본문요약": _clean_text(r["report_nm"], SUMMARY_LIMIT),
+                    "게시일": published_at,
+                    "원문URL": f"https://dart.fss.or.kr/dsaf001/main.do?rcpNo={r['rcept_no']}",
+                }
+            )
+
+    rows.sort(key=lambda row: row["게시일"], reverse=True)
     return rows
 
 
