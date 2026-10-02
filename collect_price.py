@@ -15,9 +15,7 @@ from config import (
     US_TICKERS,
 )
 
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
 US_MARKET_TZ = ZoneInfo("America/New_York")
@@ -53,9 +51,7 @@ def get_kr_end_date(now=None):
 def collect_us_price(ticker, end_date):
     # yfinance의 end는 exclusive이므로, end_date를 포함시키려면 +1일을 넘겨야 한다.
     end_exclusive = (end_date + timedelta(days=1)).strftime("%Y-%m-%d")
-    df = yf.download(
-        ticker, start=START_DATE, end=end_exclusive, auto_adjust=True, progress=False
-    )
+    df = yf.download(ticker, start=START_DATE, end=end_exclusive, auto_adjust=True, progress=False)
     if df.empty:
         raise ValueError(f"{ticker}: no data returned")
     if isinstance(df.columns, pd.MultiIndex):
@@ -67,6 +63,13 @@ def collect_us_price(ticker, end_date):
 
 def collect_kr_price(ticker, end_date):
     # pykrx의 todate는 inclusive이므로 end_date를 그대로 넘긴다.
+    # 주의: adjusted=True는 KRX가 아니라 네이버 금융의 일별 시세를 그대로 가져온다
+    # (pykrx 내부적으로 naver.get_market_ohlcv_by_date에 위임). 무상증자/액면분할
+    # 같은 주식수 변동은 네이버 차트 자체가 과거값을 되돌려 반영하지만, 현금 배당이나
+    # ETF 분배금(148070 등)은 반영되지 않는다 — 배당(분배)지급일에 가격이 그만큼
+    # 빠지는 것이 그대로 로그 수익률에 잡힌다. yfinance(auto_adjust=True)는 미국
+    # 종목의 현금배당을 반영하므로, 한국/미국 수익률의 "배당 처리 방식"이 다르다는
+    # 점을 RL/RAG 쪽에 공유해야 한다.
     fromdate = START_DATE.replace("-", "")
     todate = end_date.strftime("%Y%m%d")
     df = stock.get_market_ohlcv(fromdate, todate, ticker, adjusted=True)

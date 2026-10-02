@@ -16,9 +16,7 @@ from config import END_DATE, RAW_NEWS_DIR, START_DATE
 
 load_dotenv()
 
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
 DART_API_KEY = os.getenv("DART_API_KEY")
@@ -38,9 +36,7 @@ DART_REPORT_KEYWORDS = ("사업보고서", "분기보고서", "반기보고서")
 SEC_CONTACT_EMAIL = os.getenv("SEC_EDGAR_CONTACT_EMAIL")
 SEC_TICKER_CIK_URL = "https://www.sec.gov/files/company_tickers.json"
 SEC_SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik:010d}.json"
-SEC_FILING_URL = (
-    "https://www.sec.gov/Archives/edgar/data/{cik}/{accession_nodash}/{doc}"
-)
+SEC_FILING_URL = "https://www.sec.gov/Archives/edgar/data/{cik}/{accession_nodash}/{doc}"
 SEC_TARGETS = {"AAPL": "AAPL", "MSFT": "MSFT", "NVDA": "NVDA"}
 SEC_FORM_TYPES = ("10-K", "10-Q")
 
@@ -109,9 +105,7 @@ def _get_cik(ticker):
     if _sec_cik_cache is None:
         response = requests.get(SEC_TICKER_CIK_URL, headers=_sec_headers(), timeout=10)
         response.raise_for_status()
-        _sec_cik_cache = {
-            row["ticker"]: row["cik_str"] for row in response.json().values()
-        }
+        _sec_cik_cache = {row["ticker"]: row["cik_str"] for row in response.json().values()}
     cik = _sec_cik_cache.get(ticker)
     if cik is None:
         raise ValueError(f"CIK not found for ticker {ticker}")
@@ -223,9 +217,7 @@ def collect_all():
             collected.setdefault(code, []).extend(rows)
             print(f"[DART {name}({code})] {len(rows)} disclosures collected")
         except Exception:
-            logger.exception(
-                "Failed to collect DART disclosures for %s (%s)", code, name
-            )
+            logger.exception("Failed to collect DART disclosures for %s (%s)", code, name)
         time.sleep(REQUEST_DELAY_SEC)
 
     for ticker, name in SEC_TARGETS.items():
@@ -241,9 +233,7 @@ def collect_all():
         rows_by_ticker = collect_hankyung_news()
         for ticker, rows in rows_by_ticker.items():
             collected.setdefault(ticker, []).extend(rows)
-            print(
-                f"[Hankyung RSS {NEWS_TARGETS[ticker]['corp_name']}] {len(rows)} news collected"
-            )
+            print(f"[Hankyung RSS {NEWS_TARGETS[ticker]['corp_name']}] {len(rows)} news collected")
     except Exception:
         logger.exception("Failed to collect Hankyung RSS news")
 

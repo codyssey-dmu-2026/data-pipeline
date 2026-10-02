@@ -6,6 +6,7 @@ import pandas as pd
 
 from config import (
     FEATURES_PATH,
+    PRICES_PATH,
     PROCESSED_DATA_DIR,
     RAW_DATA_DIR,
     RAW_PRICE_DIR,
@@ -17,6 +18,12 @@ from indicators import compute_macd, compute_rsi
 
 
 def merge_prices():
+    """가격을 병합해 (prices, is_market_open) 튜플로 반환한다.
+
+    prices: 티커별 수정종가 (ffill로 휴장일을 채운 뒤 공통 구간만 남긴 값).
+    is_market_open: prices와 동일한 인덱스/티커의 0/1 플래그.
+        1 = 그날 실제 거래 데이터가 있었음, 0 = ffill로 채운 휴장일.
+    """
     csv_paths = sorted(RAW_PRICE_DIR.glob("*.csv"))
     if not csv_paths:
         raise FileNotFoundError(f"No price CSV files found in {RAW_PRICE_DIR}")
@@ -30,6 +37,7 @@ def merge_prices():
     merged = pd.concat(series_list, axis=1).sort_index()
     total_rows = len(merged)
     before_na = int(merged.isna().sum().sum())
+    was_present = merged.notna()
 
     # 한국/미국 휴장일은 직전 종가로 채운다 (ffill만 사용, 미래 값으로 채우지 않음).
     # ffill 후에도 남는 결측치(일부 종목의 상장/수집 시작 이전 구간)만 제거한다.
@@ -38,12 +46,15 @@ def merge_prices():
     common = filled.dropna(how="any")
     common_rows = len(common)
 
+    is_market_open = was_present.loc[common.index].astype(int)
+    is_market_open.columns = [f"{c}_is_market_open" for c in is_market_open.columns]
+
     print(
         f"merge_prices: {total_rows} rows, {filled_na} NaNs forward-filled -> "
         f"{common_rows} rows ({total_rows - common_rows} leading rows dropped)"
     )
 
-    return common
+    return common, is_market_open
 
 
 def compute_features(prices, rsi_length=14):
@@ -72,9 +83,7 @@ def detect_outliers(prices, threshold=0.30):
         for flag_date in flagged_dates:
             idx = prices.index.get_loc(flag_date)
             prev_price = prices[ticker].iloc[idx - 1] if idx > 0 else np.nan
-            next_price = (
-                prices[ticker].iloc[idx + 1] if idx < len(prices) - 1 else np.nan
-            )
+            next_price = prices[ticker].iloc[idx + 1] if idx < len(prices) - 1 else np.nan
 
             other_tickers = [t for t in prices.columns if t != ticker]
             other_returns = returns.loc[flag_date, other_tickers]
@@ -86,9 +95,7 @@ def detect_outliers(prices, threshold=0.30):
                 "prev_price": prev_price,
                 "curr_price": prices[ticker].iloc[idx],
                 "next_price": next_price,
-                "n_other_tickers_also_outlier": int(
-                    (other_returns.abs() > threshold).sum()
-                ),
+                "n_other_tickers_also_outlier": int((other_returns.abs() > threshold).sum()),
             }
             for other_ticker in other_tickers:
                 row[f"{other_ticker}_return"] = other_returns[other_ticker]
@@ -162,9 +169,7 @@ def normalize(features, train_end_date, n_std=5.0):
     return normalized, scaler
 
 
-def _scaler_manifest_entry(
-    scaler, window_idx, train_start, train_end, test_end, columns, path
-):
+def _scaler_manifest_entry(scaler, window_idx, train_start, train_end, test_end, columns, path):
     return {
         "window": window_idx,
         "path": str(path),
@@ -206,13 +211,9 @@ def normalize_walk_forward(
     for i, (train_start, train_end, test_end) in enumerate(windows, start=1):
         train = features[(features.index >= train_start) & (features.index < train_end)]
         if train.empty:
-            raise ValueError(
-                f"window {i}: no training rows in [{train_start}, {train_end})"
-            )
+            raise ValueError(f"window {i}: no training rows in [{train_start}, {train_end})")
 
-        window_slice = features[
-            (features.index >= train_start) & (features.index < test_end)
-        ]
+        window_slice = features[(features.index >= train_start) & (features.index < test_end)]
 
         scaler = ZScoreWinsorizer(n_std=n_std)
         scaler.fit(train)
@@ -237,15 +238,19 @@ def normalize_walk_forward(
 
     with open(manifest_path, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2, ensure_ascii=False)
-    print(
-        f"normalize_walk_forward: saved manifest ({len(windows)} windows) -> {manifest_path}"
-    )
+    print(f"normalize_walk_forward: saved manifest ({len(windows)} windows) -> {manifest_path}")
 
     return results, manifest
 
 
 def run_pipeline(train_end_date=TRAIN_END_DATE):
-    prices = merge_prices()
+    prices, is_market_open = merge_prices()
+
+    PRICES_PATH.parent.mkdir(parents=True, exist_ok=True)
+    prices_with_flags = pd.concat([prices, is_market_open], axis=1)
+    prices_with_flags.to_parquet(PRICES_PATH)
+    print(f"run_pipeline: saved prices -> {PRICES_PATH} (shape={prices_with_flags.shape})")
+
     features = compute_features(prices)
     clean = handle_missing(features)
     normalized, _scaler = normalize(clean, train_end_date)

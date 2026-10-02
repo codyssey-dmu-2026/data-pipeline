@@ -4,14 +4,12 @@ import collect_news
 import collect_price
 from preprocess import detect_outliers, merge_prices, run_pipeline
 
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
 
 def run_detect_outliers():
-    prices = merge_prices()
+    prices, _is_market_open = merge_prices()
     return detect_outliers(prices)
 
 

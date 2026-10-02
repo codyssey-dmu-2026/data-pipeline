@@ -9,6 +9,7 @@ PROCESSED_DATA_DIR = DATA_DIR / "processed"
 RAW_PRICE_DIR = RAW_DATA_DIR / "prices"
 RAW_NEWS_DIR = RAW_DATA_DIR / "news"
 
+PRICES_PATH = PROCESSED_DATA_DIR / "prices.parquet"
 RETURNS_PATH = PROCESSED_DATA_DIR / "returns.parquet"
 FEATURES_PATH = PROCESSED_DATA_DIR / "features.parquet"
 WALK_FORWARD_MANIFEST_PATH = PROCESSED_DATA_DIR / "walk_forward_manifest.json"
