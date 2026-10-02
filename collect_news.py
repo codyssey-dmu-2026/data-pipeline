@@ -201,9 +201,29 @@ def collect_hankyung_news():
 
 
 def save_news(ticker, rows):
-    df = pd.DataFrame(rows, columns=COLUMNS)
+    """기존 CSV에 새 수집 결과를 덧붙이고, 원문URL 기준으로 중복을 제거한다.
+
+    원문URL이 DART rcept_no/SEC accession number/기사 링크로부터 만들어지는
+    고유 식별자이므로 dedup 키로 쓴다. 같은 URL이 다시 수집되면(예: 매일 실행
+    시 최근 공시/기사가 재수집되는 경우) 최신 수집 결과로 덮어쓴다.
+    """
     path = RAW_NEWS_DIR / f"{ticker}.csv"
-    df.to_csv(path, index=False, encoding="utf-8-sig")
+    new_df = pd.DataFrame(rows, columns=COLUMNS)
+
+    if path.exists():
+        existing_df = pd.read_csv(path, encoding="utf-8-sig")
+    else:
+        existing_df = pd.DataFrame(columns=COLUMNS)
+
+    combined = pd.concat([existing_df, new_df], ignore_index=True)
+    combined = combined.drop_duplicates(subset=["원문URL"], keep="last").reset_index(drop=True)
+    n_duplicates = len(existing_df) + len(new_df) - len(combined)
+
+    combined.to_csv(path, index=False, encoding="utf-8-sig")
+    print(
+        f"save_news({ticker}): +{len(new_df)} new rows, {n_duplicates} duplicates "
+        f"removed -> {len(combined)} total rows"
+    )
     return path
 
 
