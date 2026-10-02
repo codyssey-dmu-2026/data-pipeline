@@ -37,6 +37,9 @@ DART_REPORT_KEYWORDS = ("사업보고서", "분기보고서", "반기보고서")
 SEC_CONTACT_EMAIL = os.getenv("SEC_EDGAR_CONTACT_EMAIL")
 SEC_TICKER_CIK_URL = "https://www.sec.gov/files/company_tickers.json"
 SEC_SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik:010d}.json"
+# filings.recent가 다 못 담은 과거분이 올라가는 페이지. filings.files[i].name이
+# 파일명을 알려준다(예: CIK0000789019-submissions-001.json).
+SEC_SUBMISSIONS_FILE_URL = "https://data.sec.gov/submissions/{name}"
 SEC_FILING_URL = "https://www.sec.gov/Archives/edgar/data/{cik}/{accession_nodash}/{doc}"
 SEC_TARGETS = {"AAPL": "AAPL", "MSFT": "MSFT", "NVDA": "NVDA"}
 SEC_FORM_TYPES = ("10-K", "10-Q")
@@ -52,8 +55,9 @@ HANKYUNG_FEED_CATEGORIES = ["finance", "economy", "international"]
 MAX_ARTICLES_PER_TICKER = 20
 
 NEWS_TARGETS = {
+    # "MS"는 모건스탠리/MS경영대학원 등과 겹쳐 오탐이 많아 별칭에서 제외.
     "AAPL": {"corp_name": "AAPL", "aliases": ["애플", "AAPL"]},
-    "MSFT": {"corp_name": "MSFT", "aliases": ["마이크로소프트", "MSFT", "MS"]},
+    "MSFT": {"corp_name": "MSFT", "aliases": ["마이크로소프트", "MSFT"]},
     "NVDA": {"corp_name": "NVDA", "aliases": ["엔비디아", "NVDA"]},
     "005930": {"corp_name": "삼성전자", "aliases": ["삼성전자"]},
     "000660": {"corp_name": "SK하이닉스", "aliases": ["SK하이닉스", "하이닉스"]},
@@ -132,17 +136,15 @@ def _get_cik(ticker):
     return cik
 
 
-def collect_sec_filings(ticker):
-    cik = _get_cik(ticker)
-    url = SEC_SUBMISSIONS_URL.format(cik=cik)
-    response = requests.get(url, headers=_sec_headers(), timeout=10)
-    response.raise_for_status()
-    recent = response.json()["filings"]["recent"]
-    acceptance_times = recent.get("acceptanceDateTime") or []
+def _rows_from_sec_filings(filings, ticker, cik):
+    """filings.recent 또는 filings.files의 한 페이지(평탄한 병렬 배열 dict)에서
+    행을 추출한다. 두 구조 모두 동일한 키(form/filingDate/accessionNumber/...)를
+    가진다."""
+    acceptance_times = filings.get("acceptanceDateTime") or []
 
     rows = []
-    for i, form in enumerate(recent["form"]):
-        filing_date = recent["filingDate"][i]
+    for i, form in enumerate(filings["form"]):
+        filing_date = filings["filingDate"][i]
         if form not in SEC_FORM_TYPES or filing_date < START_DATE:
             continue
 
@@ -154,11 +156,11 @@ def collect_sec_filings(ticker):
         else:
             published_at = _to_kst_iso(datetime.strptime(filing_date, "%Y-%m-%d"))
 
-        accession_nodash = recent["accessionNumber"][i].replace("-", "")
+        accession_nodash = filings["accessionNumber"][i].replace("-", "")
         doc_url = SEC_FILING_URL.format(
-            cik=cik, accession_nodash=accession_nodash, doc=recent["primaryDocument"][i]
+            cik=cik, accession_nodash=accession_nodash, doc=filings["primaryDocument"][i]
         )
-        title = f"{form} ({recent['reportDate'][i]})"
+        title = f"{form} ({filings['reportDate'][i]})"
         rows.append(
             {
                 "종목명": ticker,
@@ -171,6 +173,37 @@ def collect_sec_filings(ticker):
     return rows
 
 
+def collect_sec_filings(ticker):
+    """SEC EDGAR 제출 내역을 수집한다.
+
+    filings.recent는 최근 최대 1000건 정도만 담고 있어서, 공시가 많은 회사는
+    START_DATE까지 거슬러 올라가지 못하고 중간에 끊길 수 있다(예: MSFT/NVDA는
+    recent가 2020년 중반부터만 커버해 2018~2020 구간의 10-K/10-Q가 통째로
+    빠짐). recent의 가장 오래된 filingDate가 START_DATE보다 늦으면,
+    filings.files에 있는 과거 페이지도 필요한 범위만큼 추가로 읽는다.
+    """
+    cik = _get_cik(ticker)
+    url = SEC_SUBMISSIONS_URL.format(cik=cik)
+    response = requests.get(url, headers=_sec_headers(), timeout=10)
+    response.raise_for_status()
+    filings = response.json()["filings"]
+
+    rows = _rows_from_sec_filings(filings["recent"], ticker, cik)
+
+    earliest_recent = min(filings["recent"]["filingDate"], default=None)
+    if earliest_recent is not None and earliest_recent > START_DATE:
+        for file_meta in filings.get("files", []):
+            if file_meta["filingTo"] < START_DATE:
+                continue  # 이 페이지 전체가 START_DATE 이전 -> 요청할 필요 없음
+            time.sleep(REQUEST_DELAY_SEC)
+            file_url = SEC_SUBMISSIONS_FILE_URL.format(name=file_meta["name"])
+            file_response = requests.get(file_url, headers=_sec_headers(), timeout=10)
+            file_response.raise_for_status()
+            rows.extend(_rows_from_sec_filings(file_response.json(), ticker, cik))
+
+    return rows
+
+
 def fetch_feed_entries(category):
     url = HANKYUNG_FEED_URL.format(category=category)
     response = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=10)
@@ -178,9 +211,20 @@ def fetch_feed_entries(category):
     return feedparser.parse(response.content).entries
 
 
+_WORD_CHAR_CLASS = r"[A-Za-z가-힣]"
+
+
 def _title_matches(title, aliases):
+    """별칭이 제목에서 독립된 단어로 등장할 때만 매칭한다.
+
+    경계 문자 클래스에 영문뿐 아니라 한글 음절(가-힣)도 포함한다. 그래서
+    "애플" 별칭이 "애플리케이션"(뒤에 한글 '리' 연속) 안에 묻혀 있거나
+    "파인애플"(앞에 한글 '인' 연속) 끝에 붙어 있는 경우는 매칭에서 제외된다.
+    다만 이 규칙은 "애플이", "엔비디아는"처럼 별칭 뒤에 조사가 공백 없이
+    바로 붙는 정상적인 멘션도 함께 걸러낸다는 트레이드오프가 있다.
+    """
     for alias in aliases:
-        pattern = rf"(?<![A-Za-z]){re.escape(alias)}(?![A-Za-z])"
+        pattern = rf"(?<!{_WORD_CHAR_CLASS}){re.escape(alias)}(?!{_WORD_CHAR_CLASS})"
         if re.search(pattern, title):
             return True
     return False
