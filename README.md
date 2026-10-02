@@ -81,11 +81,19 @@ python -m pytest
 5. **결측치 처리** (`handle_missing()`) — `ffill()`로 먼저 채우고, 그래도 남는 행(지표 워밍업 구간 등)은 `dropna()`로 제거한다. bfill이나 미래 값으로 채우는 방식은 사용하지 않는다(look-ahead bias 방지).
 6. **정규화** (`normalize()` / `ZScoreWinsorizer`) — `config.TRAIN_END_DATE` 이전 구간에서만 평균·표준편차·winsorize 상하한(평균±5표준편차)을 계산(`fit`)하고, 그 통계량을 train+test 전체 구간에 동일하게 적용(`transform`)한다. 정규화 전에 winsorize를 먼저 적용해 극단값이 평균/표준편차 계산을 왜곡하지 않게 한다. 전체 기간 통계로 계산하면 data leakage가 되므로 반드시 이 순서를 지킨다.
 
-최종적으로 `data/processed/features.parquet`(전체 피처)와 `data/processed/returns.parquet`(로그수익률 컬럼만)로 저장된다.
+7. **워크포워드 정규화** (`normalize_walk_forward()`) — `config.WALK_FORWARD_WINDOWS`의 윈도우마다(train 2018~2021/test 2022부터 train 2018~2024/test 2025까지 4개) 해당 train 구간만으로 따로 fit하고 `[train_start, test_end)` 구간을 transform한다. 윈도우별 기간·평균·표준편차·winsorize 상하한·변수 순서는 `walk_forward_manifest.json`에 저장되고, 파일 경로는 manifest 기준 상대경로라 API 서버에서도 그대로 쓸 수 있다.
+
+최종적으로 `data/processed/`에 다음 파일이 저장된다.
+- `prices.parquet`: 정규화 전 병합 수정종가와 종목별 `{ticker}_is_market_open`(1 = 실제 거래일, 0 = ffill로 채운 휴장일)
+- `features.parquet`: 정규화된 피처 36개(return/rsi/macd × 12종목) 뒤에 `{ticker}_is_market_open` 12개를 붙인 48개 컬럼. `TRAIN_END_DATE` 기준 단일 분할이다. 플래그는 정규화하지 않은 0/1이다. ffill로 채운 휴장일 수익률은 z-score 후 0이 아닌 작은 값(예: 2026-09-24 005930은 −0.02)이 되므로 플래그로 실제 보합일과 구분해야 한다
+- `features_window{1..4}.parquet`, `walk_forward_manifest.json`: 워크포워드 윈도우별 피처(같은 48개 컬럼)와 통계량. manifest의 `columns`는 정규화한 컬럼(평균·표준편차 있음), `passthrough_columns`는 그대로 붙인 플래그이고, 파일 컬럼 순서는 `columns` 다음 `passthrough_columns`다
+- `returns.parquet`: 정규화 전 로그수익률
+- `manifest.json`: `collect_price.py` 실행마다 수집 시각과 시장별 종료일을 버전으로 누적 기록. 미국은 뉴욕 16:00 마감이 지난 마지막 거래일, 한국은 시각과 상관없이 당일을 뺀 전 거래일이다(네이버 일별 시세는 장 마감 뒤에도 당일 종가가 바뀐 사례가 있어 확정값만 쓴다)
 
 ## 뉴스/공시 수집 규칙과 네이버 → 한국경제 전환 이유
 
-- **DART 공시**: `OpenDartReader`로 삼성전자(005930), SK하이닉스(000660)의 정기공시(사업보고서/분기보고서/반기보고서)를 수집한다.
+- **DART 공시**: `OpenDartReader`로 삼성전자(005930), SK하이닉스(000660)의 정기공시(A: 사업/분기/반기보고서), 주요사항보고(B), 거래소공시(I, 수시공시)를 수집한다.
+- **SEC EDGAR**: AAPL, MSFT, NVDA의 10-K, 10-Q, 8-K를 수집한다. `filings.recent`가 2018년까지 닿지 않는 회사는 `filings.files`의 과거 페이지도 읽는다.
 - **뉴스**: 원래 네이버 뉴스 검색 API를 사용할 계획이었으나 NCP 카드 등록 문제로 사용이 막혔다. 대안으로 네이버 금융/뉴스의 RSS 피드를 찾아봤지만, `finance.naver.com`과 `news.naver.com`의 `robots.txt`가 **모든 경로를 `Disallow`** 처리하고 있고(특히 `news.naver.com`은 AI/RAG 봇을 명시적으로 차단) CLAUDE.md의 "robots.txt 준수" 원칙에 위배돼 네이버 계열 도메인 자체를 포기했다. 대신 CLAUDE.md에 이미 허용 소스로 명시된 **한국경제(hankyung.com) RSS**(`/feed/finance`, `/feed/economy`, `/feed/international`)를 사용한다. 이 경로들은 `hankyung.com/robots.txt`에서 막혀있지 않음을 확인했다. 종목별 RSS는 제공되지 않아, 카테고리 RSS의 최신 기사 중 제목에 종목 키워드(예: 삼성전자, 엔비디아, MS, AAPL 등 한글 별칭 포함)가 포함된 기사만 필터링하는 방식으로 구현했다.
 - **요청 빈도**: DART/한국경제 요청 사이마다 `time.sleep(1.0)`으로 최소 1초 딜레이를 둔다.
 - **저장 형식**: 종목명, 제목, 본문요약(300자 이내), 게시일, 원문URL 5개 컬럼으로 통일해 `data/raw/news/{종목코드 또는 티커}.csv`에 저장한다. RSS 자체에는 본문 요약이 없어서, 매칭된 기사는 원문 페이지(`/article/...`, robots.txt 허용 경로)에서 본문을 추출해 300자로 자른다.
@@ -95,8 +103,13 @@ python -m pytest
 
 - **RSS 스냅샷 한계**: 한국경제 RSS는 카테고리별 최신 약 50건만 제공한다. 그 시점에 AAPL/애플처럼 제목에 직접 언급된 기사가 없으면 수집 건수가 0이 될 수 있다(실제로 AAPL은 0건이 나온 적이 있음). 데이터 오류가 아니라 뉴스 흐름과 제목 매칭 방식의 구조적 한계다.
 - **제목 매칭 방식의 재현율**: 본문 내용까지 검사하지 않고 제목만 필터링하므로, 종목이 본문에서만 언급된 기사는 누락된다. 재현율보다 정확성(오탐 최소화)을 우선한 선택이다.
-- **DART 본문요약 = 제목**: DART 공시 목록 API는 본문 텍스트를 제공하지 않아, `본문요약` 컬럼에 보고서명(`report_nm`)을 그대로 사용한다. 실제 공시 본문을 요약하려면 `dart.document()`로 원문(XML)을 추가로 받아 파싱하는 별도 작업이 필요하다.
+- **DART·SEC 행에는 본문 요약이 없다**: DART 공시 목록 API와 SEC EDGAR submissions API는 제목·날짜·URL만 주고 본문을 주지 않는다. 그래서 이 두 소스의 행은 `본문요약`이 `요약 없음(원문URL 참고)`로 채워지고, 실제 내용은 `원문URL`에서 확인해야 한다(2026-10-02 기준 1,172건 중 1,165건). 한국경제 RSS 기사만 원문 페이지에서 추출한 실제 본문 300자를 갖는다. 원문 앞부분을 받아 채우는 방식은 확인해 보고 쓰지 않았다:
+  - DART 주요사항보고서(B): 앞 약 250자가 표지(회사명, 대표이사, 주소, 작성책임자 이름·전화번호)다.
+  - DART 거래소공시(I): `dart.document()`로 원문을 받을 수 없다(status 014 "파일이 존재하지 않습니다").
+  - SEC 8-K: 앞 300자가 inline XBRL 태그이고, 실제 "Item" 섹션은 약 2,800자 이후에 시작한다.
+
+  의미 있는 요약을 만들려면 소스별 섹션 파싱(8-K의 Item 섹션 등)이 필요하고, 실행마다 약 1,000건의 추가 요청이 생긴다.
 - **이상치 리포트는 수동 단계**: `detect_outliers()`는 `main.py`/`run_pipeline()` 자동 흐름에 포함돼 있지 않다. 데이터 품질 점검은 사람이 따로 실행해서 리포트를 검토해야 한다.
-- **단일 walk-forward 컷**: `config.TRAIN_END_DATE` 하나로 train/test를 한 번만 나눈다. 여러 walk-forward 윈도우로 검증하려면 `normalize(features, train_end_date=...)`를 원하는 날짜로 여러 번 호출해야 한다.
+- **`features.parquet`는 단일 분할이다**: 하위 호환용으로 `config.TRAIN_END_DATE`(2024-01-01) 이전 구간으로만 fit한다. 그 이전 구간(2022·2023)을 테스트하면 미래 통계가 섞이므로, 그 경우 워크포워드 윈도우별 파일(`features_window{n}.parquet`)을 쓴다.
 - **Python 버전 제약**: `OpenDartReader==0.2.2`는 최신 0.3.x(Python 3.13+ 전용)를 설치할 수 없어 다운그레이드했고, `pyarrow==17.0.0`은 Python 3.14용 사전 빌드 wheel이 없다. 현재 `.venv`는 Python 3.12 기준으로 만들어져 있다.
 - **`KRX 로그인 실패` 로그**: `pykrx`가 출력하는 안내성 메시지로, 공개 시세 조회 자체에는 영향이 없다.

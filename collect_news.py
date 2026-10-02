@@ -74,6 +74,12 @@ NEWS_TARGETS = {
 
 COLUMNS = ["종목명", "제목", "본문요약", "게시일", "원문URL"]
 
+# DART 목록 API와 SEC submissions API는 본문을 주지 않는다. 원문 앞부분을 받아
+# 채우는 방식은 쓰지 않는다: DART 주요사항보고서는 앞 ~250자가 표지(작성책임자
+# 이름·전화번호 포함), 거래소공시(I)는 DART document API로 받을 수 없고(status
+# 014), SEC 8-K는 앞부분이 inline XBRL 태그다. 제목 복사 대신 명시적으로 표시한다.
+NO_SUMMARY_PLACEHOLDER = "요약 없음(원문URL 참고)"
+
 KST = ZoneInfo("Asia/Seoul")
 
 
@@ -119,7 +125,7 @@ def collect_dart_disclosures(corp_code, corp_name):
                 {
                     "종목명": corp_name,
                     "제목": r["report_nm"],
-                    "본문요약": _clean_text(r["report_nm"], SUMMARY_LIMIT),
+                    "본문요약": NO_SUMMARY_PLACEHOLDER,
                     "게시일": published_at,
                     "원문URL": f"https://dart.fss.or.kr/dsaf001/main.do?rcpNo={r['rcept_no']}",
                 }
@@ -180,7 +186,7 @@ def _rows_from_sec_filings(filings, ticker, cik):
             {
                 "종목명": ticker,
                 "제목": title,
-                "본문요약": _clean_text(title, SUMMARY_LIMIT),
+                "본문요약": NO_SUMMARY_PLACEHOLDER,
                 "게시일": published_at,
                 "원문URL": doc_url,
             }

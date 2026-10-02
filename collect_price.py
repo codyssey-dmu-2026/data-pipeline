@@ -21,7 +21,12 @@ logger = logging.getLogger(__name__)
 US_MARKET_TZ = ZoneInfo("America/New_York")
 US_MARKET_CLOSE = time(16, 0)
 KR_MARKET_TZ = ZoneInfo("Asia/Seoul")
-KR_MARKET_CLOSE = time(15, 30)
+
+
+def _latest_weekday_on_or_before(day):
+    while day.weekday() >= 5:  # 5=Sat, 6=Sun
+        day -= timedelta(days=1)
+    return day
 
 
 def _last_completed_trading_day(tz, close_time, now=None):
@@ -35,9 +40,7 @@ def _last_completed_trading_day(tz, close_time, now=None):
     candidate = now.date()
     if now.time() < close_time:
         candidate -= timedelta(days=1)
-    while candidate.weekday() >= 5:  # 5=Sat, 6=Sun
-        candidate -= timedelta(days=1)
-    return candidate
+    return _latest_weekday_on_or_before(candidate)
 
 
 def get_us_end_date(now=None):
@@ -45,7 +48,13 @@ def get_us_end_date(now=None):
 
 
 def get_kr_end_date(now=None):
-    return _last_completed_trading_day(KR_MARKET_TZ, KR_MARKET_CLOSE, now)
+    """한국은 시각과 상관없이 당일을 빼고 전 거래일까지만 확정값으로 본다.
+
+    네이버 일별 시세는 15:30 장 마감 뒤에도 당일 종가가 바뀐 사례가 있다
+    (005930의 2026-09-23 종가: 당일 19:46 KST 수집 시 286,000원, 이후 286,500원).
+    """
+    now = (now or datetime.now(KR_MARKET_TZ)).astimezone(KR_MARKET_TZ)
+    return _latest_weekday_on_or_before(now.date() - timedelta(days=1))
 
 
 def collect_us_price(ticker, end_date):
@@ -63,13 +72,12 @@ def collect_us_price(ticker, end_date):
 
 def collect_kr_price(ticker, end_date):
     # pykrx의 todate는 inclusive이므로 end_date를 그대로 넘긴다.
-    # 주의: adjusted=True는 KRX가 아니라 네이버 금융의 일별 시세를 그대로 가져온다
-    # (pykrx 내부적으로 naver.get_market_ohlcv_by_date에 위임). 무상증자/액면분할
-    # 같은 주식수 변동은 네이버 차트 자체가 과거값을 되돌려 반영하지만, 현금 배당이나
-    # ETF 분배금(148070 등)은 반영되지 않는다 — 배당(분배)지급일에 가격이 그만큼
-    # 빠지는 것이 그대로 로그 수익률에 잡힌다. yfinance(auto_adjust=True)는 미국
-    # 종목의 현금배당을 반영하므로, 한국/미국 수익률의 "배당 처리 방식"이 다르다는
-    # 점을 RL/RAG 쪽에 공유해야 한다.
+    # adjusted=True는 KRX가 아니라 네이버 금융 일별 시세를 가져온다(pykrx가
+    # naver.get_market_ohlcv_by_date에 위임). 이 시세는 ETF 분배금도 과거값을
+    # 낮춰 반영한다: 148070의 2025-12-30 분배금 3,742원(3.43%) 전후로 급락이 없고,
+    # 분배 후 종가(2026-04-02 106,925원)가 공시 NAV(106,924원)와 일치한다.
+    # 조정은 "조회 시점" 기준이라 매 실행마다 전체 기간을 다시 받아 덮어쓴다.
+    # 개별주 현금배당(0.5% 안팎)은 일간 변동에 묻혀 데이터로는 확인하지 못했다.
     fromdate = START_DATE.replace("-", "")
     todate = end_date.strftime("%Y%m%d")
     df = stock.get_market_ohlcv(fromdate, todate, ticker, adjusted=True)
@@ -128,7 +136,7 @@ def collect_all():
     us_end_date = get_us_end_date()
     kr_end_date = get_kr_end_date()
     logger.info("US end_date=%s (America/New_York 16:00 마감 기준)", us_end_date)
-    logger.info("KR end_date=%s (Asia/Seoul 15:30 마감 기준)", kr_end_date)
+    logger.info("KR end_date=%s (Asia/Seoul 당일 제외, 전 거래일)", kr_end_date)
 
     for ticker in US_TICKERS:
         try:

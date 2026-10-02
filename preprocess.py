@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -13,6 +14,7 @@ from config import (
     RETURNS_PATH,
     TRAIN_END_DATE,
     WALK_FORWARD_MANIFEST_PATH,
+    WALK_FORWARD_WINDOWS,
 )
 from indicators import compute_macd, compute_rsi
 
@@ -169,7 +171,9 @@ def normalize(features, train_end_date, n_std=5.0):
     return normalized, scaler
 
 
-def _scaler_manifest_entry(scaler, window_idx, train_start, train_end, test_end, columns, path):
+def _scaler_manifest_entry(
+    scaler, window_idx, train_start, train_end, test_end, columns, passthrough_columns, path
+):
     return {
         "window": window_idx,
         "path": str(path),
@@ -178,11 +182,18 @@ def _scaler_manifest_entry(scaler, window_idx, train_start, train_end, test_end,
         "test_end": str(pd.Timestamp(test_end).date()),
         "n_std": scaler.n_std,
         "columns": list(columns),
+        "passthrough_columns": list(passthrough_columns),
         "mean": scaler.mean_.to_dict(),
         "std": scaler.std_.to_dict(),
         "lower": scaler.lower_.to_dict(),
         "upper": scaler.upper_.to_dict(),
     }
+
+
+def _append_passthrough(normalized, passthrough):
+    if passthrough is None:
+        return normalized
+    return pd.concat([normalized, passthrough.loc[normalized.index]], axis=1)
 
 
 def normalize_walk_forward(
@@ -191,6 +202,7 @@ def normalize_walk_forward(
     n_std=5.0,
     output_dir=PROCESSED_DATA_DIR,
     manifest_path=WALK_FORWARD_MANIFEST_PATH,
+    passthrough=None,
 ):
     """워크포워드 윈도우별로 각각 독립적인 fit/transform을 수행한다.
 
@@ -198,8 +210,10 @@ def normalize_walk_forward(
     각 윈도우는 [train_start, train_end) 구간만으로 평균/표준편차/winsorize
     기준을 계산(fit)하고, [train_start, test_end) 구간에 transform을 적용한다
     (다른 윈도우의 train 구간 데이터가 섞이지 않도록 fit은 윈도우별로 독립).
-    결과는 윈도우별 parquet(features_window{n}.parquet)로 저장하고,
-    통계량/구간/컬럼 순서는 manifest_path에 JSON으로 저장해 추론 시 재사용한다.
+    passthrough(예: is_market_open 0/1 플래그)는 정규화하지 않고 그대로 뒤에 붙인다.
+    결과는 윈도우별 parquet(features_window{n}.parquet)로 저장하고, 통계량/구간/
+    컬럼 순서(columns 다음 passthrough_columns)는 manifest_path에 JSON으로 저장해
+    추론 시 재사용한다.
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -217,14 +231,24 @@ def normalize_walk_forward(
 
         scaler = ZScoreWinsorizer(n_std=n_std)
         scaler.fit(train)
-        normalized = scaler.transform(window_slice)
+        normalized = _append_passthrough(scaler.transform(window_slice), passthrough)
 
         out_path = output_dir / f"features_window{i}.parquet"
         normalized.to_parquet(out_path)
 
+        # API 서버/Docker에서도 쓸 수 있게 manifest 기준 상대경로로 기록한다.
+        rel_path = Path(os.path.relpath(out_path, manifest_path.parent)).as_posix()
+        passthrough_columns = [] if passthrough is None else passthrough.columns
         manifest["windows"].append(
             _scaler_manifest_entry(
-                scaler, i, train_start, train_end, test_end, features.columns, out_path
+                scaler,
+                i,
+                train_start,
+                train_end,
+                test_end,
+                features.columns,
+                passthrough_columns,
+                rel_path,
             )
         )
 
@@ -253,7 +277,19 @@ def run_pipeline(train_end_date=TRAIN_END_DATE):
 
     features = compute_features(prices)
     clean = handle_missing(features)
+    # is_market_open은 0/1 그대로 붙인다. ffill로 채운 휴장일의 수익률 0을
+    # 실제로 보합인 날과 RL이 구분할 수 있게 한다.
+    # features.parquet는 train_end_date 기준 단일 분할(하위 호환용)이라 그 이전
+    # 구간을 테스트하면 미래 통계가 섞인다. 2022~2025 테스트는 윈도우별 파일을 쓴다.
+    normalize_walk_forward(
+        clean,
+        WALK_FORWARD_WINDOWS,
+        output_dir=PROCESSED_DATA_DIR,
+        manifest_path=WALK_FORWARD_MANIFEST_PATH,
+        passthrough=is_market_open,
+    )
     normalized, _scaler = normalize(clean, train_end_date)
+    normalized = _append_passthrough(normalized, is_market_open)
 
     FEATURES_PATH.parent.mkdir(parents=True, exist_ok=True)
     normalized.to_parquet(FEATURES_PATH)

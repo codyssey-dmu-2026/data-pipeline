@@ -1,10 +1,18 @@
+import json
+
 import numpy as np
 import pandas as pd
 import pytest
 
 import preprocess
 from config import KR_TICKERS, US_TICKERS
-from preprocess import compute_features, handle_missing, merge_prices, normalize
+from preprocess import (
+    compute_features,
+    handle_missing,
+    merge_prices,
+    normalize,
+    normalize_walk_forward,
+)
 
 ALL_TICKERS = US_TICKERS + list(KR_TICKERS.keys())
 ZSCORE_ABS_LIMIT = 6.0
@@ -116,3 +124,69 @@ def test_is_market_open_flags_ffilled_holidays(synthetic_price_dir):
 
     # is_market_open은 prices와 동일한 인덱스를 가져야 한다
     assert is_market_open.index.equals(prices.index)
+
+
+def test_normalize_walk_forward_fits_each_window_on_its_train_rows_only(
+    clean_features, synthetic_price_dir, tmp_path
+):
+    dates = synthetic_price_dir
+    windows = [(dates[0], dates[100], dates[150]), (dates[0], dates[150], dates[200])]
+
+    # 각 윈도우의 train 이후 값을 크게 바꿔도 그 윈도우 통계량은 그대로여야 한다
+    shifted = clean_features.copy()
+    shifted[shifted.index >= dates[100]] *= 1000
+
+    _, base = normalize_walk_forward(
+        clean_features, windows, output_dir=tmp_path / "a", manifest_path=tmp_path / "a.json"
+    )
+    _, perturbed = normalize_walk_forward(
+        shifted, windows, output_dir=tmp_path / "b", manifest_path=tmp_path / "b.json"
+    )
+    assert base["windows"][0]["mean"] == perturbed["windows"][0]["mean"]
+    assert base["windows"][0]["std"] == perturbed["windows"][0]["std"]
+    assert base["windows"][1]["mean"] != perturbed["windows"][1]["mean"]
+
+
+def test_normalize_walk_forward_writes_portable_manifest(
+    clean_features, synthetic_price_dir, tmp_path
+):
+    dates = synthetic_price_dir
+    windows = [(dates[0], dates[100], dates[150]), (dates[0], dates[150], dates[200])]
+    manifest_path = tmp_path / "walk_forward_manifest.json"
+
+    results, _ = normalize_walk_forward(
+        clean_features, windows, output_dir=tmp_path, manifest_path=manifest_path
+    )
+
+    saved = json.loads(manifest_path.read_text(encoding="utf-8"))
+    for entry, (normalized, _scaler), (_, _, test_end) in zip(saved["windows"], results, windows):
+        assert entry["path"] == f"features_window{entry['window']}.parquet"
+        assert (manifest_path.parent / entry["path"]).exists()
+        assert entry["columns"] == list(clean_features.columns)
+        assert normalized.index.max() < test_end
+
+
+def test_run_pipeline_appends_raw_market_open_flags(synthetic_price_dir, tmp_path, monkeypatch):
+    dates = synthetic_price_dir
+    for name in ["PRICES_PATH", "FEATURES_PATH", "RETURNS_PATH"]:
+        monkeypatch.setattr(preprocess, name, tmp_path / f"{name.lower()}.parquet")
+    monkeypatch.setattr(preprocess, "PROCESSED_DATA_DIR", tmp_path)
+    monkeypatch.setattr(preprocess, "WALK_FORWARD_MANIFEST_PATH", tmp_path / "wf.json")
+    monkeypatch.setattr(preprocess, "WALK_FORWARD_WINDOWS", [(dates[0], dates[100], dates[150])])
+
+    preprocess.run_pipeline(train_end_date=dates[150])
+
+    flag_cols = [f"{t}_is_market_open" for t in ALL_TICKERS]
+    features = pd.read_parquet(tmp_path / "features_path.parquet")
+    window = pd.read_parquet(tmp_path / "features_window1.parquet")
+    entry = json.loads((tmp_path / "wf.json").read_text(encoding="utf-8"))["windows"][0]
+
+    # conftest 규칙상 AAPL(ALL_TICKERS[2])은 dates[50]이 비어 ffill된 휴장일이다
+    for df in (features, window):
+        assert set(flag_cols) <= set(df.columns)
+        assert set(np.unique(df[flag_cols].to_numpy())) <= {0, 1}
+        assert df.loc[dates[50], f"{ALL_TICKERS[2]}_is_market_open"] == 0
+        assert df.loc[dates[51], f"{ALL_TICKERS[2]}_is_market_open"] == 1
+    assert list(window.columns) == entry["columns"] + entry["passthrough_columns"]
+    assert sorted(entry["passthrough_columns"]) == sorted(flag_cols)
+    assert not set(flag_cols) & set(entry["mean"])
