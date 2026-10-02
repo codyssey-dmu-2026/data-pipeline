@@ -1,12 +1,17 @@
+import json
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 
 from config import (
     FEATURES_PATH,
+    PROCESSED_DATA_DIR,
     RAW_DATA_DIR,
     RAW_PRICE_DIR,
     RETURNS_PATH,
     TRAIN_END_DATE,
+    WALK_FORWARD_MANIFEST_PATH,
 )
 from indicators import compute_macd, compute_rsi
 
@@ -155,6 +160,88 @@ def normalize(features, train_end_date, n_std=5.0):
         f"before {train_end_date}, transformed all {len(features)} rows"
     )
     return normalized, scaler
+
+
+def _scaler_manifest_entry(
+    scaler, window_idx, train_start, train_end, test_end, columns, path
+):
+    return {
+        "window": window_idx,
+        "path": str(path),
+        "train_start": str(pd.Timestamp(train_start).date()),
+        "train_end": str(pd.Timestamp(train_end).date()),
+        "test_end": str(pd.Timestamp(test_end).date()),
+        "n_std": scaler.n_std,
+        "columns": list(columns),
+        "mean": scaler.mean_.to_dict(),
+        "std": scaler.std_.to_dict(),
+        "lower": scaler.lower_.to_dict(),
+        "upper": scaler.upper_.to_dict(),
+    }
+
+
+def normalize_walk_forward(
+    features,
+    windows,
+    n_std=5.0,
+    output_dir=PROCESSED_DATA_DIR,
+    manifest_path=WALK_FORWARD_MANIFEST_PATH,
+):
+    """워크포워드 윈도우별로 각각 독립적인 fit/transform을 수행한다.
+
+    windows: (train_start, train_end, test_end) 튜플 리스트.
+    각 윈도우는 [train_start, train_end) 구간만으로 평균/표준편차/winsorize
+    기준을 계산(fit)하고, [train_start, test_end) 구간에 transform을 적용한다
+    (다른 윈도우의 train 구간 데이터가 섞이지 않도록 fit은 윈도우별로 독립).
+    결과는 윈도우별 parquet(features_window{n}.parquet)로 저장하고,
+    통계량/구간/컬럼 순서는 manifest_path에 JSON으로 저장해 추론 시 재사용한다.
+    """
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = Path(manifest_path)
+
+    results = []
+    manifest = {"n_std": n_std, "windows": []}
+
+    for i, (train_start, train_end, test_end) in enumerate(windows, start=1):
+        train = features[(features.index >= train_start) & (features.index < train_end)]
+        if train.empty:
+            raise ValueError(
+                f"window {i}: no training rows in [{train_start}, {train_end})"
+            )
+
+        window_slice = features[
+            (features.index >= train_start) & (features.index < test_end)
+        ]
+
+        scaler = ZScoreWinsorizer(n_std=n_std)
+        scaler.fit(train)
+        normalized = scaler.transform(window_slice)
+
+        out_path = output_dir / f"features_window{i}.parquet"
+        normalized.to_parquet(out_path)
+
+        manifest["windows"].append(
+            _scaler_manifest_entry(
+                scaler, i, train_start, train_end, test_end, features.columns, out_path
+            )
+        )
+
+        print(
+            f"normalize_walk_forward: window {i} fit (winsorize ±{n_std} std + "
+            f"z-score) on {len(train)} rows [{train_start}, {train_end}), "
+            f"transformed {len(normalized)} rows [{train_start}, {test_end}) -> {out_path}"
+        )
+
+        results.append((normalized, scaler))
+
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2, ensure_ascii=False)
+    print(
+        f"normalize_walk_forward: saved manifest ({len(windows)} windows) -> {manifest_path}"
+    )
+
+    return results, manifest
 
 
 def run_pipeline(train_end_date=TRAIN_END_DATE):

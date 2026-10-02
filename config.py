@@ -11,6 +11,7 @@ RAW_NEWS_DIR = RAW_DATA_DIR / "news"
 
 RETURNS_PATH = PROCESSED_DATA_DIR / "returns.parquet"
 FEATURES_PATH = PROCESSED_DATA_DIR / "features.parquet"
+WALK_FORWARD_MANIFEST_PATH = PROCESSED_DATA_DIR / "walk_forward_manifest.json"
 
 US_TICKERS = [
     "SPY",
