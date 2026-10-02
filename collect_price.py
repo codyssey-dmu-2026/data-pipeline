@@ -100,7 +100,7 @@ def report(label, df):
     print(f"[{label}] rows={len(df)}, start={start}, end={end}")
 
 
-def _record_manifest_version(collected_at, us_end_date, kr_end_date):
+def _record_manifest_version(collected_at, us_end_date, kr_end_date, collected, failed):
     PRICE_MANIFEST_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     if PRICE_MANIFEST_PATH.exists():
@@ -116,6 +116,9 @@ def _record_manifest_version(collected_at, us_end_date, kr_end_date):
             "start_date": START_DATE,
             "us_end_date": us_end_date.isoformat(),
             "kr_end_date": kr_end_date.isoformat(),
+            # failed 종목의 CSV는 이번 버전에서 갱신되지 않았다(이전 수집분 그대로).
+            "collected_tickers": collected,
+            "failed_tickers": failed,
         }
     )
 
@@ -138,23 +141,36 @@ def collect_all():
     logger.info("US end_date=%s (America/New_York 16:00 마감 기준)", us_end_date)
     logger.info("KR end_date=%s (Asia/Seoul 당일 제외, 전 거래일)", kr_end_date)
 
+    collected, failed = [], []
+
     for ticker in US_TICKERS:
         try:
             df = collect_us_price(ticker, us_end_date)
             save_price(ticker, df)
             report(ticker, df)
+            collected.append(ticker)
         except Exception:
             logger.exception("Failed to collect US ticker %s", ticker)
+            failed.append(ticker)
 
     for ticker, name in KR_TICKERS.items():
         try:
             df = collect_kr_price(ticker, kr_end_date)
             save_price(ticker, df)
             report(f"{ticker} ({name})", df)
+            collected.append(ticker)
         except Exception:
             logger.exception("Failed to collect KR ticker %s (%s)", ticker, name)
+            failed.append(ticker)
 
-    _record_manifest_version(collected_at, us_end_date, kr_end_date)
+    if not collected:
+        raise RuntimeError(
+            f"가격 수집이 전 종목({len(failed)}개)에서 실패해 manifest 버전을 기록하지 않았다"
+        )
+    if failed:
+        logger.warning("가격 수집 일부 실패(이번 버전에서 갱신 안 됨): %s", ", ".join(failed))
+
+    _record_manifest_version(collected_at, us_end_date, kr_end_date, collected, failed)
 
 
 if __name__ == "__main__":

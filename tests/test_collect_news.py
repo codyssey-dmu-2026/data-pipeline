@@ -194,3 +194,29 @@ def test_collect_dart_disclosures_combines_kinds_and_filters_periodic(monkeypatc
     assert rows[0]["게시일"] == "2024-05-01T00:00:00+09:00"
     assert rows[0]["원문URL"].endswith("rcpNo=3")
     assert all(r["본문요약"] == cn.NO_SUMMARY_PLACEHOLDER for r in rows)
+
+
+class _FakeHtml:
+    def __init__(self, text):
+        self.text = text
+
+    def raise_for_status(self):
+        pass
+
+
+def test_fetch_article_summary_marks_paywalled_article(monkeypatch, caplog):
+    page = "<html><body><p>회원 전용 기사입니다</p></body></html>"
+    monkeypatch.setattr(cn.requests, "get", lambda _url, **_kwargs: _FakeHtml(page))
+    url = "https://www.hankyung.com/article/202610029306i"
+
+    with caplog.at_level("WARNING"):
+        assert cn.fetch_article_summary(url) == cn.PAYWALLED_SUMMARY_PLACEHOLDER
+    assert url in caplog.text
+
+
+def test_fetch_article_summary_truncates_body(monkeypatch):
+    page = f'<div id="articletxt">{"가" * 500}</div>'
+    monkeypatch.setattr(cn.requests, "get", lambda _url, **_kwargs: _FakeHtml(page))
+    assert (
+        cn.fetch_article_summary("https://www.hankyung.com/article/1") == "가" * cn.SUMMARY_LIMIT
+    )

@@ -12,18 +12,18 @@ data_pipeline/
 ├── preprocess.py        # 병합/피처/이상치/결측치/정규화/파이프라인 실행
 ├── indicators.py        # RSI, MACD 계산 (pandas-ta)
 ├── utils.py
-├── main.py               # collect_price → preprocess 전체 파이프라인 엔트리포인트
+├── main.py               # 가격수집 → 전처리 → 뉴스/공시수집 → 이상치탐지 순서로 실행하는 엔트리포인트
 ├── data/
 │   ├── raw/
 │   │   ├── prices/       # 종목별 원본 수정종가 CSV (12개)
 │   │   └── news/         # 종목별 뉴스·공시 CSV
-│   │   └── outlier_report.csv  # detect_outliers() 결과 (수동 실행)
+│   │   └── outlier_report.csv  # detect_outliers() 결과 (main.py 마지막 단계)
 │   └── processed/
-│       ├── returns.parquet   # 정규화된 로그수익률만
-│       └── features.parquet  # 정규화된 전체 피처(return/rsi/macd)
+│       ├── returns.parquet   # 정규화 전 로그수익률 (RL 보상 계산용)
+│       └── features.parquet  # 정규화된 피처 36개 + is_market_open 플래그 12개 = 48컬럼
 ├── tests/
 │   └── test_features.py  # features.parquet 무결성 테스트
-├── .env.example          # DART_API_KEY 등 필요한 환경변수 템플릿
+├── .env.example          # DART_API_KEY, SEC_EDGAR_CONTACT_EMAIL 환경변수 템플릿
 ├── requirements.txt
 └── README.md
 ```
@@ -38,18 +38,21 @@ source .venv/bin/activate
 # 2. 의존성 설치
 pip install -r requirements.txt
 
-# 3. .env 준비 (DART_API_KEY 등, 절대 git에 커밋하지 않음)
+# 3. .env 준비 (절대 git에 커밋하지 않음)
 cp .env.example .env
-# .env를 열어 DART_API_KEY를 채워넣는다
+# .env를 열어 두 값을 채운다
+#   DART_API_KEY             DART OpenAPI 인증키
+#   SEC_EDGAR_CONTACT_EMAIL  본인 연락처 이메일. SEC EDGAR는 요청 User-Agent에 실제 연락처를
+#                            요구한다. 비워 두면 경고만 뜨고 unknown@example.com으로 요청된다.
 
-# 4. 전체 파이프라인 실행 (가격 수집 → 병합 → 피처 → 결측치 → 정규화 → parquet 저장)
+# 4. 전체 파이프라인 실행 (가격수집 → 전처리 → 뉴스/공시수집 → 이상치탐지)
 python main.py
 
 # 5. 테스트
 python -m pytest
 ```
 
-`main.py`는 `collect_price.collect_all()`과 `preprocess.run_pipeline()`만 순서대로 호출한다. 뉴스/공시 수집(`collect_news.py`)은 별도 스크립트로 분리돼 있어 필요할 때 `python collect_news.py`로 따로 실행한다(요청 빈도 제약이 있는 외부 API라 가격 수집과 텀포를 분리하는 게 안전하다). 이상치 리포트도 `python -c "from preprocess import merge_prices, detect_outliers; detect_outliers(merge_prices())"` 형태로 필요할 때 수동 실행한다.
+`main.py`는 가격수집(`collect_price.collect_all()`) → 전처리(`preprocess.run_pipeline()`) → 뉴스/공시수집(`collect_news.collect_all()`) → 이상치탐지(`detect_outliers()`) 순서로 실행한다. 한 단계가 실패해도 로그를 남기고 다음 단계로 넘어가며, 마지막에 단계별 성공/실패 요약을 출력한다. 각 단계는 `python collect_price.py`, `python collect_news.py`처럼 따로 실행할 수도 있다.
 
 ## 자산 유니버스 (12개) 및 선정 근거
 
@@ -72,12 +75,12 @@ python -m pytest
 
 ## 전처리 파이프라인 단계
 
-`preprocess.py`의 `run_pipeline()`이 아래 순서로 실행된다 (이상치 검증은 별도 수동 단계):
+전체 흐름은 아래와 같다. 1번은 `collect_price.py`, 4번은 `main.py`가 따로 호출하고, 나머지는 `preprocess.py`의 `run_pipeline()`이 실행한다.
 
 1. **수집** (`collect_price.py`) — yfinance(`auto_adjust=True`)/pykrx(`adjusted=True`)로 종목별 수정종가를 `data/raw/prices/*.csv`에 저장.
-2. **정합성** (`merge_prices()`) — 12개 종목 CSV를 하나의 DataFrame으로 병합하고, 미국/한국 휴장일 차이를 고려해 12종목 모두 거래된 날짜(intersection)만 남긴다. 병합 전후 행 수와 손실 비율을 print로 확인할 수 있다.
+2. **정합성** (`merge_prices()`) — 12개 종목 CSV를 날짜 기준으로 모두 합친 뒤(intersection이 아님), 한쪽 시장만 쉬는 휴장일은 직전 종가로 forward-fill해 전체 날짜를 유지한다. 미래 값으로 과거를 채우지 않으며, ffill 후에도 남는 결측(일부 종목의 수집 시작 이전 구간)만 앞에서 제거한다. 날짜·종목별 실제 거래 여부는 `{ticker}_is_market_open`(1/0) 플래그로 함께 만든다. 병합 전후 행 수와 ffill한 결측 수를 print로 확인할 수 있다.
 3. **지표** (`compute_features()`) — 종목별 로그수익률(`{ticker}_return`), RSI 14(`{ticker}_rsi`, `indicators.py`), MACD 12/26/9(`{ticker}_macd`)를 계산한다. `pandas-ta` RSI가 워밍업 구간(첫 13행)에도 100 같은 의미 없는 값을 채우는 문제를 확인해서, 해당 구간은 수동으로 NaN 처리한다.
-4. **이상치 검증** (`detect_outliers()`, 수동 실행) — 절대 로그수익률이 30%를 넘는 날짜를 종목별로 찾아 전/후일 가격, 같은 날 다른 11개 종목 수익률과 함께 `data/raw/outlier_report.csv`에 저장한다. 자동으로 값을 수정/삭제하지 않고 리포트만 생성해서 사람이 직접 검토(여러 종목이 동시에 튀면 시장 이벤트, 한 종목만 튀면 데이터 오류 의심)하도록 한다.
+4. **이상치 검증** (`detect_outliers()`, `main.py` 마지막 단계) — 절대 로그수익률이 30%를 넘는 날짜를 종목별로 찾아 전/후일 가격, 같은 날 다른 11개 종목 수익률과 함께 `data/raw/outlier_report.csv`에 저장한다. 자동으로 값을 수정/삭제하지 않고 리포트만 생성해서 사람이 직접 검토(여러 종목이 동시에 튀면 시장 이벤트, 한 종목만 튀면 데이터 오류 의심)하도록 한다.
 5. **결측치 처리** (`handle_missing()`) — `ffill()`로 먼저 채우고, 그래도 남는 행(지표 워밍업 구간 등)은 `dropna()`로 제거한다. bfill이나 미래 값으로 채우는 방식은 사용하지 않는다(look-ahead bias 방지).
 6. **정규화** (`normalize()` / `ZScoreWinsorizer`) — `config.TRAIN_END_DATE` 이전 구간에서만 평균·표준편차·winsorize 상하한(평균±5표준편차)을 계산(`fit`)하고, 그 통계량을 train+test 전체 구간에 동일하게 적용(`transform`)한다. 정규화 전에 winsorize를 먼저 적용해 극단값이 평균/표준편차 계산을 왜곡하지 않게 한다. 전체 기간 통계로 계산하면 data leakage가 되므로 반드시 이 순서를 지킨다.
 
@@ -87,7 +90,7 @@ python -m pytest
 - `prices.parquet`: 정규화 전 병합 수정종가와 종목별 `{ticker}_is_market_open`(1 = 실제 거래일, 0 = ffill로 채운 휴장일)
 - `features.parquet`: 정규화된 피처 36개(return/rsi/macd × 12종목) 뒤에 `{ticker}_is_market_open` 12개를 붙인 48개 컬럼. `TRAIN_END_DATE` 기준 단일 분할이다. 플래그는 정규화하지 않은 0/1이다. ffill로 채운 휴장일 수익률은 z-score 후 0이 아닌 작은 값(예: 2026-09-24 005930은 −0.02)이 되므로 플래그로 실제 보합일과 구분해야 한다
 - `features_window{1..4}.parquet`, `walk_forward_manifest.json`: 워크포워드 윈도우별 피처(같은 48개 컬럼)와 통계량. manifest의 `columns`는 정규화한 컬럼(평균·표준편차 있음), `passthrough_columns`는 그대로 붙인 플래그이고, 파일 컬럼 순서는 `columns` 다음 `passthrough_columns`다
-- `returns.parquet`: 정규화 전 로그수익률
+- `returns.parquet`: 정규화 전 로그수익률 (RL 보상 계산용)
 - `manifest.json`: `collect_price.py` 실행마다 수집 시각과 시장별 종료일을 버전으로 누적 기록. 미국은 뉴욕 16:00 마감이 지난 마지막 거래일, 한국은 시각과 상관없이 당일을 뺀 전 거래일이다(네이버 일별 시세는 장 마감 뒤에도 당일 종가가 바뀐 사례가 있어 확정값만 쓴다)
 
 ## 뉴스/공시 수집 규칙과 네이버 → 한국경제 전환 이유
@@ -96,20 +99,20 @@ python -m pytest
 - **SEC EDGAR**: AAPL, MSFT, NVDA의 10-K, 10-Q, 8-K를 수집한다. `filings.recent`가 2018년까지 닿지 않는 회사는 `filings.files`의 과거 페이지도 읽는다.
 - **뉴스**: 원래 네이버 뉴스 검색 API를 사용할 계획이었으나 NCP 카드 등록 문제로 사용이 막혔다. 대안으로 네이버 금융/뉴스의 RSS 피드를 찾아봤지만, `finance.naver.com`과 `news.naver.com`의 `robots.txt`가 **모든 경로를 `Disallow`** 처리하고 있고(특히 `news.naver.com`은 AI/RAG 봇을 명시적으로 차단) CLAUDE.md의 "robots.txt 준수" 원칙에 위배돼 네이버 계열 도메인 자체를 포기했다. 대신 CLAUDE.md에 이미 허용 소스로 명시된 **한국경제(hankyung.com) RSS**(`/feed/finance`, `/feed/economy`, `/feed/international`)를 사용한다. 이 경로들은 `hankyung.com/robots.txt`에서 막혀있지 않음을 확인했다. 종목별 RSS는 제공되지 않아, 카테고리 RSS의 최신 기사 중 제목에 종목 키워드(예: 삼성전자, 엔비디아, MS, AAPL 등 한글 별칭 포함)가 포함된 기사만 필터링하는 방식으로 구현했다.
 - **요청 빈도**: DART/한국경제 요청 사이마다 `time.sleep(1.0)`으로 최소 1초 딜레이를 둔다.
-- **저장 형식**: 종목명, 제목, 본문요약(300자 이내), 게시일, 원문URL 5개 컬럼으로 통일해 `data/raw/news/{종목코드 또는 티커}.csv`에 저장한다. RSS 자체에는 본문 요약이 없어서, 매칭된 기사는 원문 페이지(`/article/...`, robots.txt 허용 경로)에서 본문을 추출해 300자로 자른다.
-- **API Key**: `DART_API_KEY`는 `.env`로 관리하고 `.gitignore`에 포함해 git에 커밋되지 않도록 했다. 한국경제 RSS/기사 수집은 별도 인증이 필요 없다.
+- **저장 형식**: 종목명, 제목, 본문요약(300자 이내), 게시일, 원문URL 5개 컬럼으로 통일해 `data/raw/news/{종목코드 또는 티커}.csv`에 저장한다. RSS 자체에는 본문 요약이 없어서, 매칭된 기사는 원문 페이지(`/article/...`, robots.txt 허용 경로)에서 본문을 추출해 300자로 자른다. 유료/회원 전용 기사처럼 본문을 찾지 못하면 `유료/비공개 기사(원문URL 참고)`를 저장하고 경고 로그를 남긴다.
+- **API Key·연락처**: `DART_API_KEY`와 `SEC_EDGAR_CONTACT_EMAIL`은 `.env`로 관리하고, `.env`는 `.gitignore`에 포함해 git에 커밋되지 않도록 했다. 한국경제 RSS/기사 수집은 별도 인증이 필요 없다.
 
 ## 알려진 한계점
 
 - **RSS 스냅샷 한계**: 한국경제 RSS는 카테고리별 최신 약 50건만 제공한다. 그 시점에 AAPL/애플처럼 제목에 직접 언급된 기사가 없으면 수집 건수가 0이 될 수 있다(실제로 AAPL은 0건이 나온 적이 있음). 데이터 오류가 아니라 뉴스 흐름과 제목 매칭 방식의 구조적 한계다.
 - **제목 매칭 방식의 재현율**: 본문 내용까지 검사하지 않고 제목만 필터링하므로, 종목이 본문에서만 언급된 기사는 누락된다. 재현율보다 정확성(오탐 최소화)을 우선한 선택이다.
-- **DART·SEC 행에는 본문 요약이 없다**: DART 공시 목록 API와 SEC EDGAR submissions API는 제목·날짜·URL만 주고 본문을 주지 않는다. 그래서 이 두 소스의 행은 `본문요약`이 `요약 없음(원문URL 참고)`로 채워지고, 실제 내용은 `원문URL`에서 확인해야 한다(2026-10-02 기준 1,172건 중 1,165건). 한국경제 RSS 기사만 원문 페이지에서 추출한 실제 본문 300자를 갖는다. 원문 앞부분을 받아 채우는 방식은 확인해 보고 쓰지 않았다:
+- **DART·SEC 행에는 본문 요약이 없다**: DART 공시 목록 API와 SEC EDGAR submissions API는 제목·날짜·URL만 주고 본문을 주지 않는다. 그래서 이 두 소스의 행은 `본문요약`이 `요약 없음(원문URL 참고)`로 채워지고, 실제 내용은 `원문URL`에서 확인해야 한다(2026-10-02 기준 1,172건 중 1,165건). 한국경제 RSS 기사만 원문 페이지에서 추출한 실제 본문 300자를 갖는다(유료/회원 전용 기사는 제외). 원문 앞부분을 받아 채우는 방식은 확인해 보고 쓰지 않았다:
   - DART 주요사항보고서(B): 앞 약 250자가 표지(회사명, 대표이사, 주소, 작성책임자 이름·전화번호)다.
   - DART 거래소공시(I): `dart.document()`로 원문을 받을 수 없다(status 014 "파일이 존재하지 않습니다").
   - SEC 8-K: 앞 300자가 inline XBRL 태그이고, 실제 "Item" 섹션은 약 2,800자 이후에 시작한다.
 
   의미 있는 요약을 만들려면 소스별 섹션 파싱(8-K의 Item 섹션 등)이 필요하고, 실행마다 약 1,000건의 추가 요청이 생긴다.
-- **이상치 리포트는 수동 단계**: `detect_outliers()`는 `main.py`/`run_pipeline()` 자동 흐름에 포함돼 있지 않다. 데이터 품질 점검은 사람이 따로 실행해서 리포트를 검토해야 한다.
+- **이상치는 리포트만 만든다**: `detect_outliers()`는 `main.py` 마지막 단계에서 실행되지만 값을 수정하지 않는다. `data/raw/outlier_report.csv`는 사람이 직접 검토해야 한다.
 - **`features.parquet`는 단일 분할이다**: 하위 호환용으로 `config.TRAIN_END_DATE`(2024-01-01) 이전 구간으로만 fit한다. 그 이전 구간(2022·2023)을 테스트하면 미래 통계가 섞이므로, 그 경우 워크포워드 윈도우별 파일(`features_window{n}.parquet`)을 쓴다.
 - **Python 버전 제약**: `OpenDartReader==0.2.2`는 최신 0.3.x(Python 3.13+ 전용)를 설치할 수 없어 다운그레이드했고, `pyarrow==17.0.0`은 Python 3.14용 사전 빌드 wheel이 없다. 현재 `.venv`는 Python 3.12 기준으로 만들어져 있다.
 - **`KRX 로그인 실패` 로그**: `pykrx`가 출력하는 안내성 메시지로, 공개 시세 조회 자체에는 영향이 없다.

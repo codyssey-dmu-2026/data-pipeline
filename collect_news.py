@@ -79,6 +79,9 @@ COLUMNS = ["종목명", "제목", "본문요약", "게시일", "원문URL"]
 # 이름·전화번호 포함), 거래소공시(I)는 DART document API로 받을 수 없고(status
 # 014), SEC 8-K는 앞부분이 inline XBRL 태그다. 제목 복사 대신 명시적으로 표시한다.
 NO_SUMMARY_PLACEHOLDER = "요약 없음(원문URL 참고)"
+# 한국경제 유료/회원 전용 기사(URL이 ...i로 끝나는 경우가 많음)는 기사 페이지에
+# 본문 요소(#articletxt)가 없어 본문을 추출할 수 없다.
+PAYWALLED_SUMMARY_PLACEHOLDER = "유료/비공개 기사(원문URL 참고)"
 
 KST = ZoneInfo("Asia/Seoul")
 
@@ -257,6 +260,9 @@ def fetch_article_summary(url, limit=SUMMARY_LIMIT):
     soup = BeautifulSoup(response.text, "html.parser")
     body = soup.find(id="articletxt")
     text = body.get_text(separator=" ", strip=True) if body else ""
+    if not text:
+        logger.warning("기사 본문을 찾지 못함(유료/회원 전용 추정), 플레이스홀더로 저장: %s", url)
+        return PAYWALLED_SUMMARY_PLACEHOLDER
     return text[:limit]
 
 
