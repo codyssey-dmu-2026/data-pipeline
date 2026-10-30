@@ -1,5 +1,8 @@
 .env
-data/raw/
+# 뉴스·공시 CSV만 추적한다 (GitHub Actions가 6시간마다 누적 커밋). private 저장소라서 가능하며,
+# 수집 뉴스는 재배포 금지이므로 public 저장소로 옮기지 않는다.
+data/raw/*
+!data/raw/news/
 data/processed/
 __pycache__/
 *.pyc

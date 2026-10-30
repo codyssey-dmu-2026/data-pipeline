@@ -101,6 +101,7 @@ python -m pytest
 - **요청 빈도**: DART/한국경제 요청 사이마다 `time.sleep(1.0)`으로 최소 1초 딜레이를 둔다.
 - **저장 형식**: 종목명, 제목, 본문요약(300자 이내), 게시일, 원문URL 5개 컬럼으로 통일해 `data/raw/news/{종목코드 또는 티커}.csv`에 저장한다. RSS 자체에는 본문 요약이 없어서, 매칭된 기사는 원문 페이지(`/article/...`, robots.txt 허용 경로)에서 본문을 추출해 300자로 자른다. 유료/회원 전용 기사처럼 본문을 찾지 못하면 `유료/비공개 기사(원문URL 참고)`를 저장하고 경고 로그를 남긴다.
 - **API Key·연락처**: `DART_API_KEY`와 `SEC_EDGAR_CONTACT_EMAIL`은 `.env`로 관리하고, `.env`는 `.gitignore`에 포함해 git에 커밋되지 않도록 했다. 한국경제 RSS/기사 수집은 별도 인증이 필요 없다.
+- **자동 누적 수집**: `.github/workflows/collect-news.yml`이 6시간마다(UTC 00:23, 06:23, 12:23, 18:23) `collect_news.py`를 실행하고, 새 행이 있으면 `data/raw/news/*.csv`를 main에 커밋한다. 한국경제 RSS는 카테고리당 최신 50건, 약 12~14시간 분량(2026-10-31 측정)이라 하루 한 번으로는 기사가 빠진다. 저장소 Settings → Secrets에 `DART_API_KEY`, `SEC_EDGAR_CONTACT_EMAIL`을 넣어야 DART·SEC가 수집된다. Actions 탭에서 수동 실행(`Run workflow`)도 된다. 뉴스 CSV만 git으로 추적하므로(`.gitignore`), 팀원은 `git pull`로 같은 데이터를 받는다. 수집 뉴스는 재배포 금지이므로 이 저장소를 public으로 바꾸거나 다른 public 저장소에 복사하지 않는다.
 
 ## 알려진 한계점
 
